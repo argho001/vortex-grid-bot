@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Adaptive Grid Bot</title>
+    <meta http-equiv="refresh" content="30">
+    <style>
+        body { font-family: monospace; background: #1a1a2e; color: #eee; padding: 20px; }
+        .card { background: #16213e; padding: 20px; margin: 10px 0; border-radius: 8px; }
+        .stat { font-size: 24px; font-weight: bold; }
+        .green { color: #4ade80; }
+        .red { color: #f87171; }
+        .yellow { color: #fbbf24; }
+        h1 { color: #60a5fa; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+    </style>
+</head>
+<body>
+    <h1>🤖 Adaptive Grid Bot</h1>
+    <div id="status">Loading...</div>
+    <script>
+        fetch('/status')
+            .then(r => r.json())
+            .then(data => {
+                const wr = data.total_trades > 0 ? (data.wins / data.total_trades * 100).toFixed(1) : 0;
+                const pnlClass = data.total_pnl >= 0 ? 'green' : 'red';
+                document.getElementById('status').innerHTML = `
+                    <div class="card">
+                        <div>Mode: <span class="yellow">${data.mode}</span></div>
+                        <div>Symbol: ${data.symbol}</div>
+                        <div>Regime: <span class="stat">${data.regime}</span></div>
+                        <div>Grid Center: $${data.grid_center.toLocaleString()}</div>
+                    </div>
+                    <div class="grid">
+                        <div class="card">
+                            <div>Total Trades</div>
+                            <div class="stat">${data.total_trades}</div>
+                        </div>
+                        <div class="card">
+                            <div>Win Rate</div>
+                            <div class="stat">${wr}%</div>
+                        </div>
+                        <div class="card">
+                            <div>W / L</div>
+                            <div class="stat"><span class="green">${data.wins}</span> / <span class="red">${data.losses}</span></div>
+                        </div>
+                        <div class="card">
+                            <div>Total PnL</div>
+                            <div class="stat ${pnlClass}">$${data.total_pnl.toFixed(2)}</div>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div>Open Positions: ${data.positions}</div>
+                        <div>Last Update: ${data.last_update}</div>
+                        <div>Server Time: ${data.timestamp}</div>
+                    </div>
+                `;
+            })
+            .catch(e => document.getElementById('status').innerHTML = 'Error loading status');
+    </script>
+</body>
+</html>

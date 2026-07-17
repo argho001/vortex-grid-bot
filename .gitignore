@@ -1,0 +1,6 @@
+# Environment variables
+.env
+bot_state.json
+bot.log
+__pycache__/
+*.pyc

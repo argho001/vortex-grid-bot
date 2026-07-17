@@ -1,0 +1,563 @@
+"""
+ADAPTIVE GRID BOT — MULTI-COIN LIVE VERSION
+Runs XRP, ADA, INJ, FIL simultaneously.
+Each coin gets its own grid, regime detection, and trades.
+
+Environment variables:
+  BINANCE_API_KEY    - Binance futures API key
+  BINANCE_API_SECRET - Binance futures API secret
+  BASE_URL           - API URL (demo/testnet/live)
+"""
+
+import os, json, time, hmac, hashlib, logging, threading
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
+import requests
+import numpy as np
+import pandas as pd
+from web_status import start_web_server
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════
+
+# Load .env
+if os.path.exists('.env'):
+    with open('.env') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, val = line.split('=', 1)
+                os.environ[key.strip()] = val.strip()
+
+API_KEY = os.environ.get('BINANCE_API_KEY', '')
+API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
+BASE_URL = os.environ.get('BASE_URL', 'https://demo-fapi.binance.com')
+
+# Trading config
+COINS = ['IMXUSDT', 'APTUSDT', 'XLMUSDT']
+LEVERAGE = 5
+RISK_PCT = 0.03
+CHECK_INTERVAL = 60
+# Capital is dynamic - uses actual account balance at runtime
+
+# Grid parameters
+GRID_LEVELS = 6
+MAX_EXPOSURE = 0.40
+TRAIL_ATR = 5.0                 # was 3.0 — trail slower
+REGIME_LOOKBACK = 96
+REGIME_COOLDOWN = 4
+
+REGIME_PARAMS = {
+    'range':      {'sl': 0.8, 'tp': 1.0, 'grid_sp': 0.3},
+    'up':         {'sl': 1.2, 'tp': 1.5, 'grid_sp': 0.7},
+    'dn':         {'sl': 1.2, 'tp': 1.5, 'grid_sp': 0.7},
+    'strong_up':  {'sl': 1.5, 'tp': 2.0, 'grid_sp': 1.0},
+    'strong_dn':  {'sl': 1.5, 'tp': 2.0, 'grid_sp': 1.0},
+}
+
+STATE_FILE = 'bot_state.json'
+LOG_FILE = 'bot.log'
+
+# Telegram config
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
+
+# ═══════════════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()]
+)
+log = logging.getLogger('adaptive_grid')
+
+# ═══════════════════════════════════════════════════════════════
+# TELEGRAM NOTIFICATIONS
+# ═══════════════════════════════════════════════════════════════
+
+def send_telegram(message):
+    """Send message to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
+        requests.post(url, json={
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': 'HTML'
+        }, timeout=10)
+    except Exception as e:
+        log.error(f'Telegram error: {e}')
+
+# ═══════════════════════════════════════════════════════════════
+# BINANCE API
+# ═══════════════════════════════════════════════════════════════
+
+def sign(params):
+    return hmac.new(API_SECRET.encode(), urlencode(params).encode(), hashlib.sha256).hexdigest()
+
+def api_request(method, path, params=None, signed=False):
+    if params is None: params = {}
+    if signed:
+        params['timestamp'] = int(time.time() * 1000)
+        params['signature'] = sign(params)
+    url = f'{BASE_URL}{path}'
+    headers = {'X-MBX-APIKEY': API_KEY}
+    try:
+        if method == 'GET': r = requests.get(url, params=params, headers=headers, timeout=10)
+        elif method == 'POST': r = requests.post(url, params=params, headers=headers, timeout=10)
+        elif method == 'DELETE': r = requests.delete(url, params=params, headers=headers, timeout=10)
+        else: return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.error(f'API {method} {path}: {e}')
+        return None
+
+def get_balance():
+    data = api_request('GET', '/fapi/v2/account', signed=True)
+    if data and 'assets' in data:
+        for a in data['assets']:
+            if a['asset'] == 'USDT':
+                return float(a['availableBalance'])
+    return None
+
+def get_klines(symbol, interval='15m', limit=200):
+    data = api_request('GET', '/fapi/v1/klines', params={'symbol': symbol, 'interval': interval, 'limit': limit})
+    if not data: return pd.DataFrame()
+    df = pd.DataFrame(data, columns=['ts','o','h','l','c','v','ct','qv','n','tbb','tbq','ig'])
+    df = df[['ts','o','h','l','c','v']].astype(float)
+    df['dt'] = pd.to_datetime(df['ts'], unit='ms')
+    df.set_index('dt', inplace=True)
+    return df
+
+def get_lot_step(symbol):
+    data = api_request('GET', '/fapi/v1/exchangeInfo', params={'symbol': symbol})
+    if data and 'symbols' in data:
+        for s in data['symbols']:
+            if s['symbol'] == symbol:
+                for f in s['filters']:
+                    if f['filterType'] == 'LOT_SIZE':
+                        return float(f['stepSize'])
+    return 0.001
+
+def set_leverage(symbol):
+    api_request('POST', '/fapi/v1/leverage', {'symbol': symbol, 'leverage': LEVERAGE}, signed=True)
+
+def get_all_positions():
+    """Check all open positions on the exchange. Returns dict of {symbol: position_data}."""
+    data = api_request('GET', '/fapi/v2/positionRisk', signed=True)
+    if not data: return {}
+    positions = {}
+    for p in data:
+        amt = float(p.get('positionAmt', 0))
+        if abs(amt) > 0:
+            positions[p['symbol']] = {
+                'side': 'LONG' if amt > 0 else 'SHORT',
+                'qty': abs(amt),
+                'entry': float(p['entryPrice']),
+                'pnl': float(p['unRealizedProfit']),
+                'margin': abs(amt) * float(p['entryPrice']) / LEVERAGE
+            }
+    return positions
+
+def get_open_orders(symbol=None):
+    """Check all open orders. Returns list of orders."""
+    params = {}
+    if symbol: params['symbol'] = symbol
+    data = api_request('GET', '/fapi/v1/openOrders', params=params, signed=True)
+    return data if data else []
+
+def place_order(symbol, side, qty, sl_price, tp_price, lot_step):
+    qty = round(int(qty / lot_step) * lot_step, 8)
+    if qty <= 0: return False
+    
+    order = api_request('POST', '/fapi/v1/order', {
+        'symbol': symbol, 'side': side, 'type': 'MARKET', 'quantity': qty
+    }, signed=True)
+    
+    if not order or 'orderId' not in order:
+        log.error(f'{symbol} entry failed: {order}')
+        return False
+    
+    log.info(f'{symbol} ENTRY: {side} {qty} @ market')
+    send_telegram(f'🟢 <b>NEW TRADE</b>\n{symbol} {side} {qty}\nSL: {sl_price:.4f} | TP: {tp_price:.4f}')
+    
+    sl_side = 'SELL' if side == 'BUY' else 'BUY'
+    sl = api_request('POST', '/fapi/v1/order', {
+        'symbol': symbol, 'side': sl_side, 'type': 'STOP_MARKET',
+        'quantity': qty, 'stopPrice': round(sl_price, 4), 'reduceOnly': 'true'
+    }, signed=True)
+    
+    tp = api_request('POST', '/fapi/v1/order', {
+        'symbol': symbol, 'side': sl_side, 'type': 'TAKE_PROFIT_MARKET',
+        'quantity': qty, 'stopPrice': round(tp_price, 4), 'reduceOnly': 'true'
+    }, signed=True)
+    
+    if not sl: log.warning(f'{symbol} SL failed')
+    if not tp: log.warning(f'{symbol} TP failed')
+    
+    log.info(f'{symbol} SL={sl_price:.4f} TP={tp_price:.4f}')
+    return True
+
+def cancel_all_orders(symbol):
+    api_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': symbol}, signed=True)
+
+# ═══════════════════════════════════════════════════════════════
+# INDICATORS & REGIME
+# ═══════════════════════════════════════════════════════════════
+
+def ema(s, p): return s.ewm(span=p, adjust=False).mean()
+def calc_atr(h, l, c, p=14):
+    tr = pd.DataFrame({'hl':h-l, 'hc':abs(h-c.shift(1)), 'lc':abs(l-c.shift(1))}).max(axis=1)
+    return tr.rolling(p).mean()
+
+def prepare(df):
+    c, h, l, v = df['c'], df['h'], df['l'], df['v']
+    df['ema9'] = ema(c, 9); df['ema21'] = ema(c, 21); df['ema55'] = ema(c, 55)
+    df['atr'] = calc_atr(h, l, c)
+    pdm = h.diff(); mdm = -l.diff()
+    pdm = pdm.where((pdm > mdm) & (pdm > 0), 0)
+    mdm = mdm.where((mdm > pdm) & (mdm > 0), 0)
+    a14 = calc_atr(h, l, c, 14)
+    pdi = 100 * ema(pdm, 14) / a14.replace(0, 0.001)
+    mdi = 100 * ema(mdm, 14) / a14.replace(0, 0.001)
+    dx = 100 * abs(pdi - mdi) / (pdi + mdi).replace(0, 0.001)
+    df['adx'] = ema(dx, 14); df['pdi'] = pdi; df['mdi'] = mdi
+    df['ea_up'] = (df['ema9'] > df['ema21']) & (df['ema21'] > df['ema55'])
+    df['ea_dn'] = (df['ema9'] < df['ema21']) & (df['ema21'] < df['ema55'])
+    return df.dropna()
+
+def detect_regime(row):
+    adx = row['adx']
+    if adx > 30:
+        if row['ea_up'] and row['pdi'] > row['mdi']: return 'strong_up'
+        if row['ea_dn'] and row['mdi'] > row['pdi']: return 'strong_dn'
+    if adx > 20:
+        if row['ea_up'] and row['pdi'] > row['mdi']: return 'up'
+        if row['ea_dn'] and row['mdi'] > row['pdi']: return 'dn'
+    return 'range'
+
+# ═══════════════════════════════════════════════════════════════
+# GRID ENGINE (per coin)
+# ═══════════════════════════════════════════════════════════════
+
+class CoinGrid:
+    def __init__(self, symbol, lot_step):
+        self.symbol = symbol
+        self.lot_step = lot_step
+        self.grid_orders = []
+        self.grid_center = 0
+        self.current_regime = 'range'
+        self.positions = []
+        self.cooldown_until = 0
+        self.total_trades = 0
+        self.wins = 0
+        self.losses = 0
+        self.total_pnl = 0
+
+    def make_grid(self, price, atr_v, regime):
+        self.current_regime = regime
+        self.grid_center = price
+        p = REGIME_PARAMS.get(regime, REGIME_PARAMS['range'])
+        
+        # ATR-based spacing
+        sp_atr = atr_v * p['grid_sp']
+        
+        # Percentage-based spacing (minimum 0.5% of price)
+        sp_pct = price * 0.005
+        
+        # Use the larger of the two — ensures grid works for all coins
+        sp = max(sp_atr, sp_pct)
+        
+        if regime == 'range': lo, hi = price - sp*GRID_LEVELS/2, price + sp*GRID_LEVELS/2
+        elif regime == 'up': lo = price-sp*(GRID_LEVELS*0.7); hi = price+sp*(GRID_LEVELS*0.3)
+        elif regime == 'dn': lo = price-sp*(GRID_LEVELS*0.3); hi = price+sp*(GRID_LEVELS*0.7)
+        elif regime == 'strong_up': lo = price-sp*(GRID_LEVELS*0.8); hi = price+sp*(GRID_LEVELS*0.2)
+        elif regime == 'strong_dn': lo = price-sp*(GRID_LEVELS*0.2); hi = price+sp*(GRID_LEVELS*0.8)
+        else: return
+        
+        self.grid_orders = []
+        for i in range(GRID_LEVELS):
+            lp = lo + (hi-lo)*i/(GRID_LEVELS-1)
+            self.grid_orders.append({'price': lp, 'type': 'BUY' if lp < price else 'SELL', 'filled': False})
+        
+        log.info(f'{self.symbol} Grid: {regime} | center={price:.4f} | range=[{lo:.4f}, {hi:.4f}]')
+
+    def trail_grid(self, price, atr_v):
+        if self.current_regime in ('up', 'strong_up') and price > self.grid_center + atr_v * TRAIL_ATR:
+            self.make_grid(price, atr_v, self.current_regime)
+        elif self.current_regime in ('dn', 'strong_dn') and price < self.grid_center - atr_v * TRAIL_ATR:
+            self.make_grid(price, atr_v, self.current_regime)
+
+    def check_grid_hit(self, price, prev_price):
+        signals = []
+        for o in self.grid_orders:
+            if o['filled']: continue
+            if o['type'] == 'BUY' and prev_price > o['price'] and price <= o['price']:
+                signals.append(('BUY', o['price']))
+                o['filled'] = True
+            elif o['type'] == 'SELL' and prev_price < o['price'] and price >= o['price']:
+                signals.append(('SELL', o['price']))
+                o['filled'] = True
+        return signals
+
+    def get_exposure(self):
+        bal = get_balance()
+        if not bal or bal <= 0: return 1.0
+        total = sum(p.get('value', 0) for p in self.positions)
+        return total / bal
+
+# ═══════════════════════════════════════════════════════════════
+# STATE MANAGEMENT
+# ═══════════════════════════════════════════════════════════════
+
+def save_state(grids):
+    state = {}
+    for sym, grid in grids.items():
+        state[sym] = {
+            'grid_orders': grid.grid_orders,
+            'grid_center': grid.grid_center,
+            'current_regime': grid.current_regime,
+            'positions': grid.positions,
+            'cooldown_until': grid.cooldown_until,
+            'total_trades': grid.total_trades,
+            'wins': grid.wins,
+            'losses': grid.losses,
+            'total_pnl': grid.total_pnl,
+        }
+    state['_meta'] = {'last_update': datetime.now(timezone.utc).isoformat(), 'coins': COINS}
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f, indent=2)
+
+def load_state(grids):
+    if not os.path.exists(STATE_FILE): return
+    try:
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+        for sym, grid in grids.items():
+            if sym in state:
+                s = state[sym]
+                grid.grid_orders = s.get('grid_orders', [])
+                grid.grid_center = s.get('grid_center', 0)
+                grid.current_regime = s.get('current_regime', 'range')
+                grid.positions = s.get('positions', [])
+                grid.cooldown_until = s.get('cooldown_until', 0)
+                grid.total_trades = s.get('total_trades', 0)
+                grid.wins = s.get('wins', 0)
+                grid.losses = s.get('losses', 0)
+                grid.total_pnl = s.get('total_pnl', 0)
+        log.info('State loaded')
+    except Exception as e:
+        log.error(f'State load error: {e}')
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    log.info('=' * 60)
+    log.info('ADAPTIVE GRID BOT — MULTI-COIN')
+    log.info(f'Coins: {", ".join(COINS)}')
+    log.info(f'Leverage: {LEVERAGE}x | Risk: {RISK_PCT*100}%')
+    log.info(f'API: {BASE_URL}')
+    log.info('=' * 60)
+    
+    if not API_KEY or not API_SECRET:
+        log.error('Missing API credentials')
+        return
+    
+    # Check balance
+    balance = get_balance()
+    if balance:
+        log.info(f'Account balance: ${balance:.2f}')
+    
+    # Initialize grids (capital is dynamic - uses actual balance)
+    grids = {}
+    for sym in COINS:
+        lot_step = get_lot_step(sym)
+        grids[sym] = CoinGrid(sym, lot_step)
+        set_leverage(sym)
+        log.info(f'{sym} initialized (lot_step={lot_step})')
+    
+    # Load state
+    load_state(grids)
+    
+    # Initialize grids with current data
+    for sym, grid in grids.items():
+        if not grid.grid_orders:
+            df = get_klines(sym, '15m', 200)
+            if df.empty:
+                log.error(f'{sym} failed to fetch data')
+                continue
+            df = prepare(df)
+            row = df.iloc[-1]
+            regime = detect_regime(row)
+            grid.make_grid(float(row['c']), float(row['atr']), regime)
+    
+    prev_prices = {}
+    loop_count = 0
+    
+    log.info('Starting main loop...')
+    
+    while True:
+        try:
+            loop_count += 1
+            
+            # ═══ CHECK ACTUAL POSITIONS ON EXCHANGE ═══
+            exchange_positions = get_all_positions()
+            exchange_orders = {}
+            
+            for sym, grid in grids.items():
+                # Check if exchange has position for this coin
+                if sym in exchange_positions:
+                    ep = exchange_positions[sym]
+                    # Sync: if bot doesn't know about this position, log it
+                    if not grid.positions:
+                        log.warning(f'{sym} has open position on exchange but bot unaware! Side: {ep["side"]}, Qty: {ep["qty"]}, Entry: {ep["entry"]}')
+                        send_telegram(f'⚠️ <b>SYNC WARNING</b>\n{sym} has open position on exchange\nBot unaware! Side: {ep["side"]}')
+                else:
+                    # Exchange has no position, clean up bot state
+                    if grid.positions:
+                        log.info(f'{sym} position closed on exchange (SL/TP hit). Cleaning up bot state.')
+                        send_telegram(f'🔴 <b>POSITION CLOSED</b>\n{sym} SL/TP hit on exchange')
+                        grid.positions = []
+                
+                # Check open orders
+                orders = get_open_orders(sym)
+                exchange_orders[sym] = orders
+            
+            for sym, grid in grids.items():
+                try:
+                    # Fetch data
+                    df = get_klines(sym, '15m', 200)
+                    if df.empty: continue
+                    df = prepare(df)
+                    row = df.iloc[-1]
+                    price = float(row['c'])
+                    atr_v = float(row['atr'])
+                    regime = detect_regime(row)
+                    prev_price = prev_prices.get(sym, price)
+                    
+                    # Log every 10 loops
+                    if loop_count % 10 == 0:
+                        pos_info = 'None'
+                        if sym in exchange_positions:
+                            ep = exchange_positions[sym]
+                            pos_info = f'{ep["side"]} {ep["qty"]} @ {ep["entry"]:.4f} (PnL: {ep["pnl"]:.2f})'
+                        log.info(f'{sym} | Price: {price:.4f} | Regime: {regime} | Pos: {pos_info} | Orders: {len(exchange_orders.get(sym, []))} | Trades: {grid.total_trades}')
+                    
+                    # Regime change
+                    if regime != grid.current_regime:
+                        log.info(f'{sym} REGIME: {grid.current_regime} → {regime}')
+                        send_telegram(f'📊 <b>REGIME CHANGE</b>\n{sym}: {grid.current_regime} → {regime}')
+                        grid.cooldown_until = loop_count + REGIME_COOLDOWN
+                        grid.make_grid(price, atr_v, regime)
+                        
+                        # Close positions against new regime
+                        to_close = []
+                        for j, pos in enumerate(grid.positions):
+                            if regime in ('up', 'strong_up') and pos['side'] == 'SHORT': to_close.append(j)
+                            elif regime in ('dn', 'strong_dn') and pos['side'] == 'LONG': to_close.append(j)
+                        for j in sorted(to_close, reverse=True):
+                            pos = grid.positions.pop(j)
+                            close_side = 'SELL' if pos['side'] == 'LONG' else 'BUY'
+                            cancel_all_orders(sym)
+                            api_request('POST', '/fapi/v1/order', {
+                                'symbol': sym, 'side': close_side, 'type': 'MARKET',
+                                'quantity': round(pos['qty'], 8)
+                            }, signed=True)
+                            log.info(f'{sym} Closed {pos["side"]} due to regime change')
+                    
+                    # Trail grid
+                    grid.trail_grid(price, atr_v)
+                    
+                    # Cooldown
+                    if loop_count < grid.cooldown_until:
+                        prev_prices[sym] = price
+                        continue
+                    
+                    # Check grid hits
+                    signals = grid.check_grid_hit(price, prev_price)
+                    
+                    for sig_type, sig_price in signals:
+                        # Exposure check
+                        if grid.get_exposure() >= MAX_EXPOSURE: continue
+                        
+                        # Skip LONG in strong uptrend
+                        if regime == 'strong_up' and sig_type == 'BUY': continue
+                        
+                        # DYNAMIC BALANCE ALLOCATION
+                        # Count open positions across ALL coins
+                        total_open_positions = sum(len(g.positions) for g in grids.values())
+                        available_slots = len(COINS) - total_open_positions
+                        if available_slots <= 0: continue  # all slots full
+                        
+                        # Get current balance
+                        balance = get_balance()
+                        if not balance or balance <= 0: continue
+                        
+                        # Split available balance by remaining slots
+                        coin_capital = balance / available_slots
+                        
+                        # Calculate position
+                        params = REGIME_PARAMS.get(regime, REGIME_PARAMS['range'])
+                        sl_pct = atr_v * params['sl'] / price
+                        if sl_pct <= 0 or sl_pct > 0.05: continue
+                        
+                        risk_amt = coin_capital * RISK_PCT
+                        position_value = risk_amt / sl_pct
+                        qty = position_value / price
+                        
+                        # Check minimums
+                        notional = qty * price
+                        if notional < 1: continue
+                        margin_needed = notional / LEVERAGE
+                        if margin_needed > balance * 0.9: continue
+                        
+                        if sig_type == 'BUY':
+                            sl = price - atr_v * params['sl']
+                            tp = price + atr_v * params['tp']
+                            success = place_order(sym, 'BUY', qty, sl, tp, grid.lot_step)
+                            if success:
+                                grid.positions.append({'side': 'LONG', 'entry': price, 'sl': sl, 'tp': tp, 'qty': qty, 'value': position_value})
+                                grid.total_trades += 1
+                            else:
+                                # Reset grid level
+                                for o in grid.grid_orders:
+                                    if o['price'] == sig_price: o['filled'] = False; break
+                        else:
+                            sl = price + atr_v * params['sl']
+                            tp = price - atr_v * params['tp']
+                            success = place_order(sym, 'SELL', qty, sl, tp, grid.lot_step)
+                            if success:
+                                grid.positions.append({'side': 'SHORT', 'entry': price, 'sl': sl, 'tp': tp, 'qty': qty, 'value': position_value})
+                                grid.total_trades += 1
+                            else:
+                                for o in grid.grid_orders:
+                                    if o['price'] == sig_price: o['filled'] = False; break
+                    
+                    prev_prices[sym] = price
+                    
+                except Exception as e:
+                    log.error(f'{sym} error: {e}')
+            
+            save_state(grids)
+            time.sleep(CHECK_INTERVAL)
+            
+        except KeyboardInterrupt:
+            log.info('Bot stopped by user')
+            save_state(grids)
+            break
+        except Exception as e:
+            log.error(f'Loop error: {e}')
+            time.sleep(CHECK_INTERVAL)
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    web_thread = threading.Thread(target=start_web_server, args=(port,), daemon=True)
+    web_thread.start()
+    main()
