@@ -17,6 +17,9 @@ import numpy as np
 import pandas as pd
 from web_status import start_web_server
 
+# Position monitor thread - checks every 2 seconds
+position_monitor_running = True
+
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
@@ -91,6 +94,169 @@ def send_telegram(message):
         }, timeout=10)
     except Exception as e:
         log.error(f'Telegram error: {e}')
+
+def get_status_message():
+    """Generate status message for Telegram."""
+    exchange_positions = get_all_positions()
+    balance = get_balance()
+    
+    msg = '📊 <b>VORTEX STATUS</b>\n'
+    msg += '═' * 30 + '\n\n'
+    
+    # Balance
+    if balance:
+        msg += f'💰 <b>Balance:</b> ${balance:,.2f}\n\n'
+    
+    # Open positions
+    if exchange_positions:
+        msg += f'📈 <b>Open Positions ({len(exchange_positions)}):</b>\n\n'
+        total_pnl = 0
+        for sym, pos in exchange_positions.items():
+            pnl = pos['pnl']
+            total_pnl += pnl
+            emoji = '🟢' if pnl >= 0 else '🔴'
+            pnl_pct = (pnl / (pos['margin'] * LEVERAGE)) * 100 if pos['margin'] > 0 else 0
+            msg += f'{emoji} <b>{sym}</b>\n'
+            msg += f'   Side: {pos["side"]}\n'
+            msg += f'   Entry: ${pos["entry"]:.4f}\n'
+            msg += f'   Qty: {pos["qty"]}\n'
+            msg += f'   PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%)\n\n'
+        
+        total_emoji = '🟢' if total_pnl >= 0 else '🔴'
+        msg += f'{total_emoji} <b>Total PnL:</b> ${total_pnl:+.2f}\n'
+    else:
+        msg += '📭 <b>No open positions</b>\n'
+    
+    # Grid status
+    msg += '\n📊 <b>Grid Status:</b>\n'
+    for sym in COINS:
+        if sym in exchange_positions:
+            msg += f'  {sym}: Active (position open)\n'
+        else:
+            msg += f'  {sym}: Monitoring\n'
+    
+    msg += f'\n⏰ {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}'
+    
+    return msg
+
+def handle_telegram_update(update):
+    """Handle incoming Telegram message."""
+    if 'message' not in update:
+        return
+    msg = update['message']
+    text = msg.get('text', '').strip().lower()
+    chat_id = str(msg['chat']['id'])
+    
+    # Only respond to the configured chat
+    if chat_id != TELEGRAM_CHAT_ID:
+        return
+    
+    if text in ['update', '/update', 'status', '/status']:
+        status = get_status_message()
+        send_telegram(status)
+    elif text in ['help', '/help', 'start', '/start']:
+        help_msg = (
+            '🤖 <b>VORTEX Bot Commands</b>\n\n'
+            '📊 <b>update</b> — Get current status\n'
+            '📊 <b>status</b> — Same as update\n'
+            '❓ <b>help</b> — Show this message\n'
+        )
+        send_telegram(help_msg)
+
+# Track last processed Telegram update ID
+telegram_last_update_id = 0
+
+def poll_telegram():
+    """Poll Telegram for new messages."""
+    global telegram_last_update_id
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates'
+        params = {'offset': telegram_last_update_id + 1, 'timeout': 1}
+        r = requests.get(url, params=params, timeout=5)
+        data = r.json()
+        if data.get('ok') and data.get('result'):
+            for update in data['result']:
+                telegram_last_update_id = update['update_id']
+                handle_telegram_update(update)
+    except Exception as e:
+        pass  # Silent fail for polling
+
+# ═══════════════════════════════════════════════════════════════
+# POSITION MONITOR THREAD — Checks every 2 seconds
+# ═══════════════════════════════════════════════════════════════
+
+# Shared state between main loop and monitor thread
+tracked_positions = {}  # {symbol: {side, entry, qty, sl, tp}}
+position_lock = threading.Lock()
+
+def close_position_market(symbol, side, qty):
+    """Close a position with market order."""
+    close_side = 'SELL' if side == 'LONG' else 'BUY'
+    result = api_request('POST', '/fapi/v1/order', {
+        'symbol': symbol,
+        'side': close_side,
+        'type': 'MARKET',
+        'quantity': qty
+    }, signed=True)
+    return result
+
+def position_monitor():
+    """Thread that monitors positions every 2 seconds and acts as SL/TP."""
+    log.info('Position monitor thread started (checking every 2s)')
+    
+    while position_monitor_running:
+        try:
+            with position_lock:
+                positions_to_check = dict(tracked_positions)
+            
+            for symbol, pos in positions_to_check.items():
+                try:
+                    # Get current price
+                    df = get_klines(symbol, '1m', 1)
+                    if df.empty:
+                        continue
+                    price = float(df['c'].iloc[-1])
+                    
+                    sl_hit = False
+                    tp_hit = False
+                    
+                    if pos['side'] == 'LONG':
+                        sl_hit = price <= pos['sl']
+                        tp_hit = price >= pos['tp']
+                    else:  # SHORT
+                        sl_hit = price >= pos['sl']
+                        tp_hit = price <= pos['tp']
+                    
+                    if sl_hit:
+                        log.info(f'🔴 SL HIT: {symbol} {pos["side"]} @ {price:.4f} (SL: {pos["sl"]:.4f})')
+                        send_telegram(f'🔴 <b>SL HIT</b>\n{symbol} {pos["side"]}\nPrice: ${price:.4f}\nSL: ${pos["sl"]:.4f}')
+                        result = close_position_market(symbol, pos['side'], pos['qty'])
+                        if result:
+                            log.info(f'{symbol} position closed via SL')
+                        with position_lock:
+                            if symbol in tracked_positions:
+                                del tracked_positions[symbol]
+                    
+                    elif tp_hit:
+                        log.info(f'🟢 TP HIT: {symbol} {pos["side"]} @ {price:.4f} (TP: {pos["tp"]:.4f})')
+                        send_telegram(f'🟢 <b>TP HIT</b>\n{symbol} {pos["side"]}\nPrice: ${price:.4f}\nTP: ${pos["tp"]:.4f}')
+                        result = close_position_market(symbol, pos['side'], pos['qty'])
+                        if result:
+                            log.info(f'{symbol} position closed via TP')
+                        with position_lock:
+                            if symbol in tracked_positions:
+                                del tracked_positions[symbol]
+                
+                except Exception as e:
+                    log.error(f'Position monitor error for {symbol}: {e}')
+            
+            time.sleep(2)  # Check every 2 seconds
+            
+        except Exception as e:
+            log.error(f'Position monitor thread error: {e}')
+            time.sleep(5)
 
 # ═══════════════════════════════════════════════════════════════
 # BINANCE API
@@ -185,6 +351,18 @@ def place_order(symbol, side, qty, sl_price, tp_price, lot_step):
     
     log.info(f'{symbol} ENTRY: {side} {qty} @ market')
     send_telegram(f'🟢 <b>NEW TRADE</b>\n{symbol} {side} {qty}\nSL: {sl_price:.4f} | TP: {tp_price:.4f}')
+    
+    # Add to position monitor thread (acts as SL/TP)
+    pos_side = 'LONG' if side == 'BUY' else 'SHORT'
+    with position_lock:
+        tracked_positions[symbol] = {
+            'side': pos_side,
+            'entry': float(order.get('avgPrice', 0)),
+            'qty': qty,
+            'sl': sl_price,
+            'tp': tp_price
+        }
+    log.info(f'{symbol} added to position monitor: SL={sl_price:.4f}, TP={tp_price:.4f}')
     
     sl_side = 'SELL' if side == 'BUY' else 'BUY'
     sl = api_request('POST', '/fapi/v1/order', {
@@ -407,6 +585,9 @@ def main():
         try:
             loop_count += 1
             
+            # ═══ POLL TELEGRAM FOR COMMANDS ═══
+            poll_telegram()
+            
             # ═══ CHECK ACTUAL POSITIONS ON EXCHANGE ═══
             exchange_positions = get_all_positions()
             exchange_orders = {}
@@ -415,16 +596,32 @@ def main():
                 # Check if exchange has position for this coin
                 if sym in exchange_positions:
                     ep = exchange_positions[sym]
-                    # Sync: if bot doesn't know about this position, log it
-                    if not grid.positions:
+                    # Sync: if bot doesn't know about this position, warn ONCE and add to monitor
+                    if not grid.positions and sym not in tracked_positions:
                         log.warning(f'{sym} has open position on exchange but bot unaware! Side: {ep["side"]}, Qty: {ep["qty"]}, Entry: {ep["entry"]}')
-                        send_telegram(f'⚠️ <b>SYNC WARNING</b>\n{sym} has open position on exchange\nBot unaware! Side: {ep["side"]}')
+                        send_telegram(f'⚠️ <b>SYNC WARNING</b>\n{sym} has open position on exchange\nBot unaware! Side: {ep["side"]}\nEntry: ${ep["entry"]:.4f}\nQty: {ep["qty"]}\n\nAdding to position monitor (SL/TP every 2s)')
+                        # Add to position monitor thread
+                        sl = ep['entry'] * (1 + 0.012) if ep['side'] == 'SHORT' else ep['entry'] * (1 - 0.012)
+                        tp = ep['entry'] * (1 - 0.015) if ep['side'] == 'SHORT' else ep['entry'] * (1 + 0.015)
+                        with position_lock:
+                            tracked_positions[sym] = {
+                                'side': ep['side'],
+                                'entry': ep['entry'],
+                                'qty': ep['qty'],
+                                'sl': sl,
+                                'tp': tp
+                            }
+                        log.info(f'{sym} added to position monitor: SL={sl:.4f}, TP={tp:.4f}')
                 else:
                     # Exchange has no position, clean up bot state
                     if grid.positions:
                         log.info(f'{sym} position closed on exchange (SL/TP hit). Cleaning up bot state.')
                         send_telegram(f'🔴 <b>POSITION CLOSED</b>\n{sym} SL/TP hit on exchange')
                         grid.positions = []
+                    # Remove from position monitor when position closes
+                    with position_lock:
+                        if sym in tracked_positions:
+                            del tracked_positions[sym]
                 
                 # Check open orders
                 orders = get_open_orders(sym)
@@ -560,4 +757,10 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     web_thread = threading.Thread(target=start_web_server, args=(port,), daemon=True)
     web_thread.start()
+    
+    # Start position monitor thread (checks SL/TP every 2 seconds)
+    monitor_thread = threading.Thread(target=position_monitor, daemon=True)
+    monitor_thread.start()
+    log.info('Position monitor thread started')
+    
     main()
