@@ -38,26 +38,32 @@ API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
 BASE_URL = os.environ.get('BASE_URL', 'https://demo-fapi.binance.com')
 
 # Trading config
-COINS = ['IMXUSDT', 'APTUSDT', 'XLMUSDT']
-LEVERAGE = 5
-RISK_PCT = 0.03
+COINS = ['XRPUSDT']
+LEVERAGE = 10
+RISK_PCT = 0.01
 CHECK_INTERVAL = 60
 # Capital is dynamic - uses actual account balance at runtime
 
 # Grid parameters
 GRID_LEVELS = 6
 MAX_EXPOSURE = 0.40
-TRAIL_ATR = 5.0                 # was 3.0 — trail slower
+TRAIL_ATR = 5.0
 REGIME_LOOKBACK = 96
 REGIME_COOLDOWN = 4
 
+# Optimized RR: 1:2 (range) / 1:3 (strong_up)
+# Only SHORT in range and strong_up regimes
 REGIME_PARAMS = {
-    'range':      {'sl': 0.8, 'tp': 1.0, 'grid_sp': 0.3},
+    'range':      {'sl': 0.8, 'tp': 1.6, 'grid_sp': 0.3},
     'up':         {'sl': 1.2, 'tp': 1.5, 'grid_sp': 0.7},
     'dn':         {'sl': 1.2, 'tp': 1.5, 'grid_sp': 0.7},
-    'strong_up':  {'sl': 1.5, 'tp': 2.0, 'grid_sp': 1.0},
+    'strong_up':  {'sl': 1.5, 'tp': 4.5, 'grid_sp': 1.0},
     'strong_dn':  {'sl': 1.5, 'tp': 2.0, 'grid_sp': 1.0},
 }
+
+# Selective strategy: only trade SHORT in these regimes
+ALLOWED_REGIMES = {'range', 'strong_up'}
+KLINE_INTERVAL = '5m'
 
 STATE_FILE = 'bot_state.json'
 LOG_FILE = 'bot.log'
@@ -567,7 +573,7 @@ def main():
     # Initialize grids with current data
     for sym, grid in grids.items():
         if not grid.grid_orders:
-            df = get_klines(sym, '15m', 200)
+            df = get_klines(sym, KLINE_INTERVAL, 200)
             if df.empty:
                 log.error(f'{sym} failed to fetch data')
                 continue
@@ -630,7 +636,7 @@ def main():
             for sym, grid in grids.items():
                 try:
                     # Fetch data
-                    df = get_klines(sym, '15m', 200)
+                    df = get_klines(sym, KLINE_INTERVAL, 200)
                     if df.empty: continue
                     df = prepare(df)
                     row = df.iloc[-1]
@@ -654,11 +660,10 @@ def main():
                         grid.cooldown_until = loop_count + REGIME_COOLDOWN
                         grid.make_grid(price, atr_v, regime)
                         
-                        # Close positions against new regime
+                        # Close all positions on regime change (grid rebuilt with new params)
                         to_close = []
                         for j, pos in enumerate(grid.positions):
-                            if regime in ('up', 'strong_up') and pos['side'] == 'SHORT': to_close.append(j)
-                            elif regime in ('dn', 'strong_dn') and pos['side'] == 'LONG': to_close.append(j)
+                            to_close.append(j)
                         for j in sorted(to_close, reverse=True):
                             pos = grid.positions.pop(j)
                             close_side = 'SELL' if pos['side'] == 'LONG' else 'BUY'
@@ -684,8 +689,9 @@ def main():
                         # Exposure check
                         if grid.get_exposure() >= MAX_EXPOSURE: continue
                         
-                        # Skip LONG in strong uptrend
-                        if regime == 'strong_up' and sig_type == 'BUY': continue
+                        # Selective strategy: only SHORT in allowed regimes
+                        if regime not in ALLOWED_REGIMES: continue
+                        if sig_type == 'BUY': continue
                         
                         # DYNAMIC BALANCE ALLOCATION
                         # Count open positions across ALL coins
@@ -715,27 +721,16 @@ def main():
                         margin_needed = notional / LEVERAGE
                         if margin_needed > balance * 0.9: continue
                         
-                        if sig_type == 'BUY':
-                            sl = price - atr_v * params['sl']
-                            tp = price + atr_v * params['tp']
-                            success = place_order(sym, 'BUY', qty, sl, tp, grid.lot_step)
-                            if success:
-                                grid.positions.append({'side': 'LONG', 'entry': price, 'sl': sl, 'tp': tp, 'qty': qty, 'value': position_value})
-                                grid.total_trades += 1
-                            else:
-                                # Reset grid level
-                                for o in grid.grid_orders:
-                                    if o['price'] == sig_price: o['filled'] = False; break
+                        # Only SHORT trades (BUY already filtered above)
+                        sl = price + atr_v * params['sl']
+                        tp = price - atr_v * params['tp']
+                        success = place_order(sym, 'SELL', qty, sl, tp, grid.lot_step)
+                        if success:
+                            grid.positions.append({'side': 'SHORT', 'entry': price, 'sl': sl, 'tp': tp, 'qty': qty, 'value': position_value})
+                            grid.total_trades += 1
                         else:
-                            sl = price + atr_v * params['sl']
-                            tp = price - atr_v * params['tp']
-                            success = place_order(sym, 'SELL', qty, sl, tp, grid.lot_step)
-                            if success:
-                                grid.positions.append({'side': 'SHORT', 'entry': price, 'sl': sl, 'tp': tp, 'qty': qty, 'value': position_value})
-                                grid.total_trades += 1
-                            else:
-                                for o in grid.grid_orders:
-                                    if o['price'] == sig_price: o['filled'] = False; break
+                            for o in grid.grid_orders:
+                                if o['price'] == sig_price: o['filled'] = False; break
                     
                     prev_prices[sym] = price
                     
