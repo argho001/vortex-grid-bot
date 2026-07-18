@@ -660,10 +660,11 @@ def main():
                         grid.cooldown_until = loop_count + REGIME_COOLDOWN
                         grid.make_grid(price, atr_v, regime)
                         
-                        # Close all positions on regime change (grid rebuilt with new params)
+                        # Close positions only if new regime is not allowed
                         to_close = []
                         for j, pos in enumerate(grid.positions):
-                            to_close.append(j)
+                            if regime not in ALLOWED_REGIMES:
+                                to_close.append(j)
                         for j in sorted(to_close, reverse=True):
                             pos = grid.positions.pop(j)
                             close_side = 'SELL' if pos['side'] == 'LONG' else 'BUY'
