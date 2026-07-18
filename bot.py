@@ -219,11 +219,11 @@ def position_monitor():
             
             for symbol, pos in positions_to_check.items():
                 try:
-                    # Get current price
-                    df = get_klines(symbol, '1m', 1)
-                    if df.empty:
+                    # Get real-time price (faster than 1m kline)
+                    ticker = api_request('GET', '/fapi/v1/ticker/price', {'symbol': symbol})
+                    if not ticker or 'price' not in ticker:
                         continue
-                    price = float(df['c'].iloc[-1])
+                    price = float(ticker['price'])
                     
                     sl_hit = False
                     tp_hit = False
