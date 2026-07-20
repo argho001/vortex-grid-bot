@@ -318,11 +318,13 @@ def position_monitor():
                     tp_hit = False
                     
                     # ═══ TRAILING STOP ═══
-                    # After price moves 1.2× ATR in our favor, trail the SL
+                    # Activate when price reaches 50% of TP distance
                     atr_e = pos.get('atr_at_entry', 0.001)
                     if pos['side'] == 'LONG':
-                        if price > pos['entry'] + atr_e:
-                            # Price moved up 1.2 ATR → trail SL
+                        tp_dist = pos['tp'] - pos['entry']
+                        halfway = pos['entry'] + (tp_dist * 0.5)
+                        if price >= halfway:
+                            # Price reached 50% of TP → trail SL
                             new_sl = max(pos['sl'], price - atr_e * 1.2)
                             if new_sl > pos['sl']:
                                 pos['sl'] = new_sl
@@ -330,8 +332,10 @@ def position_monitor():
                         sl_hit = price <= pos['sl']
                         tp_hit = price >= pos['tp']
                     else:  # SHORT
-                        if price < pos['entry'] - atr_e:
-                            # Price moved down 1.2 ATR → trail SL
+                        tp_dist = pos['entry'] - pos['tp']
+                        halfway = pos['entry'] - (tp_dist * 0.5)
+                        if price <= halfway:
+                            # Price reached 50% of TP → trail SL
                             new_sl = min(pos['sl'], price + atr_e * 1.2)
                             if new_sl < pos['sl']:
                                 pos['sl'] = new_sl
