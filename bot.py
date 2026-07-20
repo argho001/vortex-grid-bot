@@ -82,6 +82,7 @@ MIN_RR = 2.0  # Minimum reward:risk ratio (1:2)
 # ═══ NEW: Trade history for Telegram "Recent" command ═══
 TRADE_HISTORY_FILE = 'trade_history.json'
 MAX_TRADE_HISTORY = 100
+MAX_CONCURRENT_POSITIONS = 3  # Max open positions across all coins
 
 KLINE_INTERVAL = '5m'
 
@@ -840,8 +841,9 @@ def main():
                         # DYNAMIC BALANCE ALLOCATION
                         # Count open positions across ALL coins
                         total_open_positions = sum(len(g.positions) for g in grids.values())
-                        available_slots = len(COINS) - total_open_positions
-                        if available_slots <= 0: continue  # all slots full
+                        if total_open_positions >= MAX_CONCURRENT_POSITIONS: continue  # max 3 at a time
+                        available_slots = MAX_CONCURRENT_POSITIONS - total_open_positions
+                        if available_slots <= 0: continue
                         
                         # Get current balance
                         balance = get_balance()
