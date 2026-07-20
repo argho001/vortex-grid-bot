@@ -55,10 +55,10 @@ REGIME_COOLDOWN = 4
 # Only SHORT in range and strong_up regimes
 REGIME_PARAMS = {
     'range':      {'sl': 0.8, 'tp': 1.6, 'grid_sp': 0.3},
-    'up':         {'sl': 1.2, 'tp': 1.5, 'grid_sp': 0.7},
-    'dn':         {'sl': 1.2, 'tp': 1.5, 'grid_sp': 0.7},
+    'up':         {'sl': 1.2, 'tp': 2.4, 'grid_sp': 0.7},
+    'dn':         {'sl': 1.2, 'tp': 2.4, 'grid_sp': 0.7},
     'strong_up':  {'sl': 1.5, 'tp': 4.5, 'grid_sp': 1.0},
-    'strong_dn':  {'sl': 1.5, 'tp': 2.0, 'grid_sp': 1.0},
+    'strong_dn':  {'sl': 1.5, 'tp': 3.0, 'grid_sp': 1.0},
 }
 
 # Selective strategy: trade both directions
