@@ -788,7 +788,22 @@ def main():
                     # Regime change
                     if regime != grid.current_regime:
                         log.info(f'{sym} REGIME: {grid.current_regime} → {regime}')
-                        send_telegram(f'📊 <b>REGIME CHANGE</b>\n{sym}: {grid.current_regime} → {regime}')
+                        
+                        # Human-readable regime explanation
+                        regime_info = {
+                            'range':      '📊 RANGING — Price moving sideways. Bot: SHORT + LONG',
+                            'up':         '📈 UPTREND — Price going UP. Bot: LONG only',
+                            'dn':         '📉 DOWNTREND — Price going DOWN. Bot: SHORT only',
+                            'strong_up':  '🚀 STRONG UP — Price pumping hard. Bot: SHORT (fading rally)',
+                            'strong_dn':  '💥 STRONG DOWN — Price dumping hard. Bot: LONG (fading drop)',
+                        }
+                        info = regime_info.get(regime, 'Unknown regime')
+                        
+                        send_telegram(
+                            f'📊 <b>REGIME CHANGE</b>\n'
+                            f'{sym}: {grid.current_regime} → {regime}\n\n'
+                            f'{info}'
+                        )
                         grid.cooldown_until = loop_count + REGIME_COOLDOWN
                         grid.make_grid(price, atr_v, regime)
                         
