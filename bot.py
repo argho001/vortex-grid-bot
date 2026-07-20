@@ -61,8 +61,28 @@ REGIME_PARAMS = {
     'strong_dn':  {'sl': 1.5, 'tp': 2.0, 'grid_sp': 1.0},
 }
 
-# Selective strategy: only trade SHORT in these regimes
-ALLOWED_REGIMES = {'range', 'strong_up'}
+# Selective strategy: trade both directions
+# SHORT in range, strong_up
+# LONG in range, strong_dn
+ALLOWED_REGIMES = {'range', 'strong_up', 'strong_dn'}
+REGIME_DIRECTION = {
+    'range':      ['SHORT', 'LONG'],
+    'up':         ['LONG'],
+    'dn':         ['SHORT'],
+    'strong_up':  ['SHORT'],
+    'strong_dn':  ['LONG'],
+}
+
+# ═══ NEW: ATR% filter — only trade when volatility is low ═══
+ATR_PCT_MAX = 0.15  # Max ATR as % of price (0.15% = calm market)
+
+# ═══ NEW: Min R:R filter ═══
+MIN_RR = 2.0  # Minimum reward:risk ratio (1:2)
+
+# ═══ NEW: Trade history for Telegram "Recent" command ═══
+TRADE_HISTORY_FILE = 'trade_history.json'
+MAX_TRADE_HISTORY = 100
+
 KLINE_INTERVAL = '5m'
 
 STATE_FILE = 'bot_state.json'
@@ -145,6 +165,73 @@ def get_status_message():
     
     return msg
 
+def save_trade_history(trade):
+    """Save a completed trade to history file."""
+    try:
+        history = []
+        if os.path.exists(TRADE_HISTORY_FILE):
+            with open(TRADE_HISTORY_FILE) as f:
+                history = json.load(f)
+        history.append(trade)
+        # Keep only last N trades
+        if len(history) > MAX_TRADE_HISTORY:
+            history = history[-MAX_TRADE_HISTORY:]
+        with open(TRADE_HISTORY_FILE, 'w') as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        log.error(f'Failed to save trade history: {e}')
+
+def get_recent_trades(count=5):
+    """Get recent trades from history."""
+    try:
+        if os.path.exists(TRADE_HISTORY_FILE):
+            with open(TRADE_HISTORY_FILE) as f:
+                history = json.load(f)
+            return history[-count:]
+    except:
+        pass
+    return []
+
+def get_recent_trades_message():
+    """Generate recent trades message for Telegram."""
+    trades = get_recent_trades(5)
+    if not trades:
+        return '📭 <b>No recent trades</b>'
+    
+    msg = '📋 <b>RECENT TRADES (Last 5)</b>\n'
+    msg += '═' * 30 + '\n\n'
+    
+    total_pnl = 0
+    total_fees = 0
+    
+    for i, t in enumerate(trades, 1):
+        pnl = t.get('pnl', 0)
+        fees = t.get('fees', 0)
+        total_pnl += pnl
+        total_fees += fees
+        
+        emoji = '🟢' if pnl >= 0 else '🔴'
+        side = t.get('side', '?')
+        entry = t.get('entry', 0)
+        exit_price = t.get('exit', 0)
+        qty = t.get('qty', 0)
+        reason = t.get('reason', '?')
+        regime = t.get('regime', '?')
+        duration = t.get('duration_min', 0)
+        
+        msg += f'{emoji} <b>Trade {i}</b>\n'
+        msg += f'   {side} {qty:.0f} XRP\n'
+        msg += f'   Entry: ${entry:.4f} → Exit: ${exit_price:.4f}\n'
+        msg += f'   PnL: <b>${pnl:+.2f}</b> | Fees: ${fees:.2f}\n'
+        msg += f'   Duration: {duration:.0f}min | {reason}\n'
+        msg += f'   Regime: {regime}\n\n'
+    
+    msg += '═' * 30 + '\n'
+    msg += f'📊 Total PnL: <b>${total_pnl:+.2f}</b>\n'
+    msg += f'💸 Total Fees: ${total_fees:.2f}'
+    
+    return msg
+
 def handle_telegram_update(update):
     """Handle incoming Telegram message."""
     if 'message' not in update:
@@ -160,11 +247,15 @@ def handle_telegram_update(update):
     if text in ['update', '/update', 'status', '/status']:
         status = get_status_message()
         send_telegram(status)
+    elif text in ['recent', '/recent', 'trades', '/trades']:
+        recent = get_recent_trades_message()
+        send_telegram(recent)
     elif text in ['help', '/help', 'start', '/start']:
         help_msg = (
             '🤖 <b>VORTEX Bot Commands</b>\n\n'
             '📊 <b>update</b> — Get current status\n'
             '📊 <b>status</b> — Same as update\n'
+            '📋 <b>recent</b> — Last 5 trades\n'
             '❓ <b>help</b> — Show this message\n'
         )
         send_telegram(help_msg)
@@ -228,10 +319,25 @@ def position_monitor():
                     sl_hit = False
                     tp_hit = False
                     
+                    # ═══ TRAILING STOP ═══
+                    # After price moves 1.2× ATR in our favor, trail the SL
+                    atr_e = pos.get('atr_at_entry', 0.001)
                     if pos['side'] == 'LONG':
+                        if price > pos['entry'] + atr_e:
+                            # Price moved up 1.2 ATR → trail SL
+                            new_sl = max(pos['sl'], price - atr_e * 1.2)
+                            if new_sl > pos['sl']:
+                                pos['sl'] = new_sl
+                                log.info(f'{symbol} TRAIL SL (LONG): new SL={new_sl:.4f}')
                         sl_hit = price <= pos['sl']
                         tp_hit = price >= pos['tp']
                     else:  # SHORT
+                        if price < pos['entry'] - atr_e:
+                            # Price moved down 1.2 ATR → trail SL
+                            new_sl = min(pos['sl'], price + atr_e * 1.2)
+                            if new_sl < pos['sl']:
+                                pos['sl'] = new_sl
+                                log.info(f'{symbol} TRAIL SL (SHORT): new SL={new_sl:.4f}')
                         sl_hit = price >= pos['sl']
                         tp_hit = price <= pos['tp']
                     
@@ -241,6 +347,17 @@ def position_monitor():
                         result = close_position_market(symbol, pos['side'], pos['qty'])
                         if result:
                             log.info(f'{symbol} position closed via SL')
+                            # Save trade history
+                            entry_price = pos.get('entry', 0)
+                            pnl = (entry_price - price) * pos['qty'] if pos['side'] == 'SHORT' else (price - entry_price) * pos['qty']
+                            fees = pos['qty'] * entry_price * 0.0004 + pos['qty'] * price * 0.0004
+                            save_trade_history({
+                                'symbol': symbol, 'side': pos['side'], 'entry': entry_price,
+                                'exit': price, 'qty': pos['qty'], 'pnl': pnl, 'fees': fees,
+                                'reason': 'SL', 'regime': pos.get('regime', '?'),
+                                'time': datetime.now(timezone.utc).isoformat(),
+                                'duration_min': (datetime.now(timezone.utc) - datetime.fromisoformat(pos.get('entry_time', datetime.now(timezone.utc).isoformat()))).total_seconds() / 60
+                            })
                         with position_lock:
                             if symbol in tracked_positions:
                                 del tracked_positions[symbol]
@@ -251,6 +368,17 @@ def position_monitor():
                         result = close_position_market(symbol, pos['side'], pos['qty'])
                         if result:
                             log.info(f'{symbol} position closed via TP')
+                            # Save trade history
+                            entry_price = pos.get('entry', 0)
+                            pnl = (entry_price - price) * pos['qty'] if pos['side'] == 'SHORT' else (price - entry_price) * pos['qty']
+                            fees = pos['qty'] * entry_price * 0.0004 + pos['qty'] * price * 0.0004
+                            save_trade_history({
+                                'symbol': symbol, 'side': pos['side'], 'entry': entry_price,
+                                'exit': price, 'qty': pos['qty'], 'pnl': pnl, 'fees': fees,
+                                'reason': 'TP', 'regime': pos.get('regime', '?'),
+                                'time': datetime.now(timezone.utc).isoformat(),
+                                'duration_min': (datetime.now(timezone.utc) - datetime.fromisoformat(pos.get('entry_time', datetime.now(timezone.utc).isoformat()))).total_seconds() / 60
+                            })
                         with position_lock:
                             if symbol in tracked_positions:
                                 del tracked_positions[symbol]
@@ -343,7 +471,7 @@ def get_open_orders(symbol=None):
     data = api_request('GET', '/fapi/v1/openOrders', params=params, signed=True)
     return data if data else []
 
-def place_order(symbol, side, qty, sl_price, tp_price, lot_step):
+def place_order(symbol, side, qty, sl_price, tp_price, lot_step, atr_at_entry=0.001):
     qty = round(int(qty / lot_step) * lot_step, 8)
     if qty <= 0: return False
     
@@ -366,7 +494,10 @@ def place_order(symbol, side, qty, sl_price, tp_price, lot_step):
             'entry': float(order.get('avgPrice', 0)),
             'qty': qty,
             'sl': sl_price,
-            'tp': tp_price
+            'tp': tp_price,
+            'atr_at_entry': atr_at_entry,
+            'entry_time': datetime.now(timezone.utc).isoformat(),
+            'regime': 'unknown'
         }
     log.info(f'{symbol} added to position monitor: SL={sl_price:.4f}, TP={tp_price:.4f}')
     
@@ -660,10 +791,11 @@ def main():
                         grid.cooldown_until = loop_count + REGIME_COOLDOWN
                         grid.make_grid(price, atr_v, regime)
                         
-                        # Close positions only if new regime is not allowed
+                        # Close positions only if direction not allowed in new regime
                         to_close = []
                         for j, pos in enumerate(grid.positions):
-                            if regime not in ALLOWED_REGIMES:
+                            allowed_sides = REGIME_DIRECTION.get(regime, [])
+                            if pos['side'] not in allowed_sides:
                                 to_close.append(j)
                         for j in sorted(to_close, reverse=True):
                             pos = grid.positions.pop(j)
@@ -687,12 +819,20 @@ def main():
                     signals = grid.check_grid_hit(price, prev_price)
                     
                     for sig_type, sig_price in signals:
+                        # ═══ NEW: ATR% FILTER ═══
+                        atr_pct = atr_v / price * 100
+                        if atr_pct > ATR_PCT_MAX:
+                            log.info(f'{sym} SKIP: ATR%={atr_pct:.3f}% > {ATR_PCT_MAX}% (too volatile)')
+                            continue
+                        
                         # Exposure check
                         if grid.get_exposure() >= MAX_EXPOSURE: continue
                         
-                        # Selective strategy: only SHORT in allowed regimes
-                        if regime not in ALLOWED_REGIMES: continue
-                        if sig_type == 'BUY': continue
+                        # Direction check — use REGIME_DIRECTION
+                        side = 'LONG' if sig_type == 'BUY' else 'SHORT'
+                        allowed_sides = REGIME_DIRECTION.get(regime, [])
+                        if side not in allowed_sides:
+                            continue
                         
                         # DYNAMIC BALANCE ALLOCATION
                         # Count open positions across ALL coins
@@ -712,6 +852,12 @@ def main():
                         sl_pct = atr_v * params['sl'] / price
                         if sl_pct <= 0 or sl_pct > 0.05: continue
                         
+                        # ═══ NEW: MIN R:R FILTER ═══
+                        rr_ratio = params['tp'] / params['sl']
+                        if rr_ratio < MIN_RR:
+                            log.info(f'{sym} SKIP: R:R={rr_ratio:.1f} < {MIN_RR}')
+                            continue
+                        
                         risk_amt = coin_capital * RISK_PCT
                         position_value = risk_amt / sl_pct
                         qty = position_value / price
@@ -722,12 +868,23 @@ def main():
                         margin_needed = notional / LEVERAGE
                         if margin_needed > balance * 0.9: continue
                         
-                        # Only SHORT trades (BUY already filtered above)
-                        sl = price + atr_v * params['sl']
-                        tp = price - atr_v * params['tp']
-                        success = place_order(sym, 'SELL', qty, sl, tp, grid.lot_step)
+                        # Place order
+                        order_side = 'BUY' if side == 'LONG' else 'SELL'
+                        sl = price - atr_v * params['sl'] if side == 'LONG' else price + atr_v * params['sl']
+                        tp = price + atr_v * params['tp'] if side == 'LONG' else price - atr_v * params['tp']
+                        success = place_order(sym, order_side, qty, sl, tp, grid.lot_step, atr_v)
                         if success:
-                            grid.positions.append({'side': 'SHORT', 'entry': price, 'sl': sl, 'tp': tp, 'qty': qty, 'value': position_value})
+                            grid.positions.append({
+                                'side': side, 'entry': price, 'sl': sl, 'tp': tp,
+                                'qty': qty, 'value': position_value,
+                                'entry_time': datetime.now(timezone.utc).isoformat(),
+                                'regime': regime
+                            })
+                            # Update tracked_positions with regime info
+                            with position_lock:
+                                if sym in tracked_positions:
+                                    tracked_positions[sym]['regime'] = regime
+                                    tracked_positions[sym]['entry_time'] = datetime.now(timezone.utc).isoformat()
                             grid.total_trades += 1
                         else:
                             for o in grid.grid_orders:
