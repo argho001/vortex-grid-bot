@@ -828,6 +828,9 @@ def main():
                         # Exposure check
                         if grid.get_exposure() >= MAX_EXPOSURE: continue
                         
+                        # ═══ Only 1 position per coin ═══
+                        if len(grid.positions) >= 1: continue
+                        
                         # Direction check — use REGIME_DIRECTION
                         side = 'LONG' if sig_type == 'BUY' else 'SHORT'
                         allowed_sides = REGIME_DIRECTION.get(regime, [])
