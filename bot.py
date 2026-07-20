@@ -320,10 +320,14 @@ def position_monitor():
                     # ═══ TRAILING STOP ═══
                     # Activate when price reaches 50% of TP distance
                     atr_e = pos.get('atr_at_entry', 0.001)
+                    original_sl = pos.get('original_sl', pos['sl'])
+                    trailing_active = False
+                    
                     if pos['side'] == 'LONG':
                         tp_dist = pos['tp'] - pos['entry']
                         halfway = pos['entry'] + (tp_dist * 0.5)
                         if price >= halfway:
+                            trailing_active = True
                             # Price reached 50% of TP → trail SL
                             new_sl = max(pos['sl'], price - atr_e * 1.2)
                             if new_sl > pos['sl']:
@@ -335,6 +339,7 @@ def position_monitor():
                         tp_dist = pos['entry'] - pos['tp']
                         halfway = pos['entry'] - (tp_dist * 0.5)
                         if price <= halfway:
+                            trailing_active = True
                             # Price reached 50% of TP → trail SL
                             new_sl = min(pos['sl'], price + atr_e * 1.2)
                             if new_sl < pos['sl']:
@@ -344,19 +349,47 @@ def position_monitor():
                         tp_hit = price <= pos['tp']
                     
                     if sl_hit:
-                        log.info(f'🔴 SL HIT: {symbol} {pos["side"]} @ {price:.4f} (SL: {pos["sl"]:.4f})')
-                        send_telegram(f'🔴 <b>SL HIT</b>\n{symbol} {pos["side"]}\nPrice: ${price:.4f}\nSL: ${pos["sl"]:.4f}')
+                        entry_price = pos.get('entry', 0)
+                        pnl = (entry_price - price) * pos['qty'] if pos['side'] == 'SHORT' else (price - entry_price) * pos['qty']
+                        fees = pos['qty'] * entry_price * 0.0004 + pos['qty'] * price * 0.0004
+                        pnl -= fees
+                        
+                        # Check if SL was trailed (different from original)
+                        sl_was_trailed = pos['sl'] != original_sl
+                        
+                        if sl_was_trailed:
+                            # TRAILING SL HIT — profitable exit
+                            log.info(f'🟢 TRAIL SL HIT: {symbol} {pos["side"]} @ {price:.4f} PnL=${pnl:+.2f}')
+                            send_telegram(
+                                f'🟢 <b>TRAIL SL HIT</b>\n'
+                                f'{symbol} {pos["side"]}\n'
+                                f'Entry: ${entry_price:.4f}\n'
+                                f'Exit: ${price:.4f}\n'
+                                f'SL: ${pos["sl"]:.4f} (trailed)\n'
+                                f'PnL: <b>${pnl:+.2f}</b>\n'
+                                f'Fees: ${fees:.2f}'
+                            )
+                        else:
+                            # NORMAL SL HIT — loss
+                            log.info(f'🔴 SL HIT: {symbol} {pos["side"]} @ {price:.4f} PnL=${pnl:+.2f}')
+                            send_telegram(
+                                f'🔴 <b>SL HIT</b>\n'
+                                f'{symbol} {pos["side"]}\n'
+                                f'Entry: ${entry_price:.4f}\n'
+                                f'Exit: ${price:.4f}\n'
+                                f'SL: ${pos["sl"]:.4f}\n'
+                                f'PnL: <b>${pnl:+.2f}</b>\n'
+                                f'Fees: ${fees:.2f}'
+                            )
+                        
                         result = close_position_market(symbol, pos['side'], pos['qty'])
                         if result:
                             log.info(f'{symbol} position closed via SL')
-                            # Save trade history
-                            entry_price = pos.get('entry', 0)
-                            pnl = (entry_price - price) * pos['qty'] if pos['side'] == 'SHORT' else (price - entry_price) * pos['qty']
-                            fees = pos['qty'] * entry_price * 0.0004 + pos['qty'] * price * 0.0004
                             save_trade_history({
                                 'symbol': symbol, 'side': pos['side'], 'entry': entry_price,
                                 'exit': price, 'qty': pos['qty'], 'pnl': pnl, 'fees': fees,
-                                'reason': 'SL', 'regime': pos.get('regime', '?'),
+                                'reason': 'TRAIL_SL' if sl_was_trailed else 'SL',
+                                'regime': pos.get('regime', '?'),
                                 'time': datetime.now(timezone.utc).isoformat(),
                                 'duration_min': (datetime.now(timezone.utc) - datetime.fromisoformat(pos.get('entry_time', datetime.now(timezone.utc).isoformat()))).total_seconds() / 60
                             })
@@ -365,15 +398,23 @@ def position_monitor():
                                 del tracked_positions[symbol]
                     
                     elif tp_hit:
-                        log.info(f'🟢 TP HIT: {symbol} {pos["side"]} @ {price:.4f} (TP: {pos["tp"]:.4f})')
-                        send_telegram(f'🟢 <b>TP HIT</b>\n{symbol} {pos["side"]}\nPrice: ${price:.4f}\nTP: ${pos["tp"]:.4f}')
+                        entry_price = pos.get('entry', 0)
+                        pnl = (entry_price - price) * pos['qty'] if pos['side'] == 'SHORT' else (price - entry_price) * pos['qty']
+                        fees = pos['qty'] * entry_price * 0.0004 + pos['qty'] * price * 0.0004
+                        pnl -= fees
+                        log.info(f'🟢 TP HIT: {symbol} {pos["side"]} @ {price:.4f} PnL=${pnl:+.2f}')
+                        send_telegram(
+                            f'🟢 <b>TP HIT</b>\n'
+                            f'{symbol} {pos["side"]}\n'
+                            f'Entry: ${entry_price:.4f}\n'
+                            f'Exit: ${price:.4f}\n'
+                            f'TP: ${pos["tp"]:.4f}\n'
+                            f'PnL: <b>${pnl:+.2f}</b>\n'
+                            f'Fees: ${fees:.2f}'
+                        )
                         result = close_position_market(symbol, pos['side'], pos['qty'])
                         if result:
                             log.info(f'{symbol} position closed via TP')
-                            # Save trade history
-                            entry_price = pos.get('entry', 0)
-                            pnl = (entry_price - price) * pos['qty'] if pos['side'] == 'SHORT' else (price - entry_price) * pos['qty']
-                            fees = pos['qty'] * entry_price * 0.0004 + pos['qty'] * price * 0.0004
                             save_trade_history({
                                 'symbol': symbol, 'side': pos['side'], 'entry': entry_price,
                                 'exit': price, 'qty': pos['qty'], 'pnl': pnl, 'fees': fees,
@@ -497,6 +538,7 @@ def place_order(symbol, side, qty, sl_price, tp_price, lot_step, atr_at_entry=0.
             'qty': qty,
             'sl': sl_price,
             'tp': tp_price,
+            'original_sl': sl_price,
             'atr_at_entry': atr_at_entry,
             'entry_time': datetime.now(timezone.utc).isoformat(),
             'regime': 'unknown'
