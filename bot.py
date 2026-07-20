@@ -38,7 +38,7 @@ API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
 BASE_URL = os.environ.get('BASE_URL', 'https://demo-fapi.binance.com')
 
 # Trading config
-COINS = ['XRPUSDT', 'SOLUSDT', 'DOGEUSDT', 'ETHUSDT']
+COINS = ['XRPUSDT', 'SOLUSDT', 'DOGEUSDT', 'ETHUSDT', 'SUIUSDT', 'APTUSDT', 'AAVEUSDT']
 LEVERAGE = 10
 RISK_PCT = 0.01
 CHECK_INTERVAL = 60
