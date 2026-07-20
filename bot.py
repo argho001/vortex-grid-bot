@@ -73,9 +73,6 @@ REGIME_DIRECTION = {
     'strong_dn':  ['LONG'],
 }
 
-# ═══ NEW: ATR% filter — only trade when volatility is low ═══
-ATR_PCT_MAX = 0.15  # Max ATR as % of price (0.15% = calm market)
-
 # ═══ NEW: Min R:R filter ═══
 MIN_RR = 2.0  # Minimum reward:risk ratio (1:2)
 
@@ -835,12 +832,6 @@ def main():
                     signals = grid.check_grid_hit(price, prev_price)
                     
                     for sig_type, sig_price in signals:
-                        # ═══ NEW: ATR% FILTER ═══
-                        atr_pct = atr_v / price * 100
-                        if atr_pct > ATR_PCT_MAX:
-                            log.info(f'{sym} SKIP: ATR%={atr_pct:.3f}% > {ATR_PCT_MAX}% (too volatile)')
-                            continue
-                        
                         # Exposure check
                         if grid.get_exposure() >= MAX_EXPOSURE: continue
                         
