@@ -38,7 +38,7 @@ API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
 BASE_URL = os.environ.get('BASE_URL', 'https://demo-fapi.binance.com')
 
 # Trading config
-COINS = ['XRPUSDT', 'SOLUSDT', 'DOGEUSDT', 'ETHUSDT', 'SUIUSDT', 'AAVEUSDT']
+COINS = ['XRPUSDT', 'DOGEUSDT', 'ETHUSDT']
 LEVERAGE = 10
 RISK_PCT = 0.01
 CHECK_INTERVAL = 60
@@ -67,10 +67,10 @@ REGIME_PARAMS = {
 ALLOWED_REGIMES = {'range', 'strong_up', 'strong_dn'}
 REGIME_DIRECTION = {
     'range':      ['SHORT', 'LONG'],
-    'up':         ['LONG'],
-    'dn':         ['SHORT'],
-    'strong_up':  ['SHORT'],
-    'strong_dn':  ['LONG'],
+    'up':         ['SHORT', 'LONG'],
+    'dn':         ['SHORT', 'LONG'],
+    'strong_up':  ['SHORT', 'LONG'],
+    'strong_dn':  ['SHORT', 'LONG'],
 }
 
 # ═══ NEW: Min R:R filter ═══
@@ -287,13 +287,23 @@ tracked_positions = {}  # {symbol: {side, entry, qty, sl, tp}}
 position_lock = threading.Lock()
 
 def close_position_market(symbol, side, qty):
-    """Close a position with market order."""
+    """Close a position with market order. Safely checks position exists first."""
+    # Verify position still exists on exchange before closing
+    exchange_positions = get_all_positions()
+    if symbol not in exchange_positions:
+        log.warning(f'{symbol} close requested but no position on exchange. Skipping.')
+        return None
+    
+    # Cancel any existing SL/TP orders first to avoid conflicts
+    cancel_all_orders(symbol)
+    
     close_side = 'SELL' if side == 'LONG' else 'BUY'
     result = api_request('POST', '/fapi/v1/order', {
         'symbol': symbol,
         'side': close_side,
         'type': 'MARKET',
-        'quantity': qty
+        'quantity': qty,
+        'reduceOnly': 'true'
     }, signed=True)
     return result
 
@@ -529,7 +539,7 @@ def place_order(symbol, side, qty, sl_price, tp_price, lot_step, atr_at_entry=0.
     log.info(f'{symbol} ENTRY: {side} {qty} @ market')
     send_telegram(f'🟢 <b>NEW TRADE</b>\n{symbol} {side} {qty}\nSL: {sl_price:.4f} | TP: {tp_price:.4f}')
     
-    # Add to position monitor thread (acts as SL/TP)
+    # Add to position monitor thread (handles SL/TP every 2s with trailing)
     pos_side = 'LONG' if side == 'BUY' else 'SHORT'
     with position_lock:
         tracked_positions[symbol] = {
@@ -544,22 +554,6 @@ def place_order(symbol, side, qty, sl_price, tp_price, lot_step, atr_at_entry=0.
             'regime': 'unknown'
         }
     log.info(f'{symbol} added to position monitor: SL={sl_price:.4f}, TP={tp_price:.4f}')
-    
-    sl_side = 'SELL' if side == 'BUY' else 'BUY'
-    sl = api_request('POST', '/fapi/v1/order', {
-        'symbol': symbol, 'side': sl_side, 'type': 'STOP_MARKET',
-        'quantity': qty, 'stopPrice': round(sl_price, 4), 'reduceOnly': 'true'
-    }, signed=True)
-    
-    tp = api_request('POST', '/fapi/v1/order', {
-        'symbol': symbol, 'side': sl_side, 'type': 'TAKE_PROFIT_MARKET',
-        'quantity': qty, 'stopPrice': round(tp_price, 4), 'reduceOnly': 'true'
-    }, signed=True)
-    
-    if not sl: log.warning(f'{symbol} SL failed')
-    if not tp: log.warning(f'{symbol} TP failed')
-    
-    log.info(f'{symbol} SL={sl_price:.4f} TP={tp_price:.4f}')
     return True
 
 def cancel_all_orders(symbol):
@@ -658,11 +652,16 @@ class CoinGrid:
             if o['filled']: continue
             if o['type'] == 'BUY' and prev_price > o['price'] and price <= o['price']:
                 signals.append(('BUY', o['price']))
-                o['filled'] = True
             elif o['type'] == 'SELL' and prev_price < o['price'] and price >= o['price']:
                 signals.append(('SELL', o['price']))
-                o['filled'] = True
         return signals
+
+    def mark_filled(self, price):
+        """Mark grid level as filled only after successful trade."""
+        for o in self.grid_orders:
+            if abs(o['price'] - price) < 0.0001:
+                o['filled'] = True
+                break
 
     def get_exposure(self):
         bal = get_balance()
@@ -740,6 +739,8 @@ def main():
         lot_step = get_lot_step(sym)
         grids[sym] = CoinGrid(sym, lot_step)
         set_leverage(sym)
+        # Cancel stale SL/TP orders from previous runs
+        cancel_all_orders(sym)
         log.info(f'{sym} initialized (lot_step={lot_step})')
     
     # Load state
@@ -781,6 +782,8 @@ def main():
                     if not grid.positions and sym not in tracked_positions:
                         log.warning(f'{sym} has open position on exchange but bot unaware! Side: {ep["side"]}, Qty: {ep["qty"]}, Entry: {ep["entry"]}')
                         send_telegram(f'⚠️ <b>SYNC WARNING</b>\n{sym} has open position on exchange\nBot unaware! Side: {ep["side"]}\nEntry: ${ep["entry"]:.4f}\nQty: {ep["qty"]}\n\nAdding to position monitor (SL/TP every 2s)')
+                        # Cancel any stale exchange orders to avoid conflicts
+                        cancel_all_orders(sym)
                         # Add to position monitor thread
                         sl = ep['entry'] * (1 + 0.012) if ep['side'] == 'SHORT' else ep['entry'] * (1 - 0.012)
                         tp = ep['entry'] * (1 - 0.015) if ep['side'] == 'SHORT' else ep['entry'] * (1 + 0.015)
@@ -907,7 +910,9 @@ def main():
                         # Calculate position
                         params = REGIME_PARAMS.get(regime, REGIME_PARAMS['range'])
                         sl_pct = atr_v * params['sl'] / price
-                        if sl_pct <= 0 or sl_pct > 0.05: continue
+                        if sl_pct <= 0 or sl_pct > 0.05:
+                            log.info(f'{sym} SKIP: sl_pct={sl_pct*100:.2f}% out of range (0-5%)')
+                            continue
                         
                         # ═══ NEW: MIN R:R FILTER ═══
                         rr_ratio = params['tp'] / params['sl']
@@ -919,11 +924,16 @@ def main():
                         position_value = risk_amt / sl_pct
                         qty = position_value / price
                         
-                        # Check minimums
+                        # Check minimums (Binance min notional = $5 for most, $20 for ETH)
                         notional = qty * price
-                        if notional < 1: continue
+                        min_notional = 20 if sym == 'ETHUSDT' else 5
+                        if notional < min_notional:
+                            log.info(f'{sym} SKIP: notional ${notional:.2f} < min ${min_notional}')
+                            continue
                         margin_needed = notional / LEVERAGE
-                        if margin_needed > balance * 0.9: continue
+                        if margin_needed > coin_capital * 0.9:
+                            log.info(f'{sym} SKIP: margin ${margin_needed:.2f} > 90% of allocated ${coin_capital:.2f}')
+                            continue
                         
                         # Place order
                         order_side = 'BUY' if side == 'LONG' else 'SELL'
@@ -931,8 +941,13 @@ def main():
                         tp = price + atr_v * params['tp'] if side == 'LONG' else price - atr_v * params['tp']
                         success = place_order(sym, order_side, qty, sl, tp, grid.lot_step, atr_v)
                         if success:
+                            # Use actual fill price from exchange instead of kline price
+                            actual_entry = price  # fallback
+                            with position_lock:
+                                if sym in tracked_positions:
+                                    actual_entry = tracked_positions[sym].get('entry', price)
                             grid.positions.append({
-                                'side': side, 'entry': price, 'sl': sl, 'tp': tp,
+                                'side': side, 'entry': actual_entry, 'sl': sl, 'tp': tp,
                                 'qty': qty, 'value': position_value,
                                 'entry_time': datetime.now(timezone.utc).isoformat(),
                                 'regime': regime
@@ -942,10 +957,8 @@ def main():
                                 if sym in tracked_positions:
                                     tracked_positions[sym]['regime'] = regime
                                     tracked_positions[sym]['entry_time'] = datetime.now(timezone.utc).isoformat()
+                            grid.mark_filled(sig_price)
                             grid.total_trades += 1
-                        else:
-                            for o in grid.grid_orders:
-                                if o['price'] == sig_price: o['filled'] = False; break
                     
                     prev_prices[sym] = price
                     
